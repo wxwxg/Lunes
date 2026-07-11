@@ -444,13 +444,19 @@ fi
 
 echo "[INFO] 测试代理连接..."
 for i in {1..3}; do
-  if curl -x socks5://127.0.0.1:1080 -s --max-time 15 https://api.ipify.org > /dev/null 2>&1; then
-    echo "[INFO] ✅ 代理连接成功"
+  ip_info=$(curl -x socks5://127.0.0.1:1080 -s --max-time 15 https://ipinfo.io/json || true)
+  
+  if [ -n "$ip_info" ] && echo "$ip_info" | jq -e '.ip' > /dev/null 2>&1; then
+    ip_addr=$(echo "$ip_info" | jq -r '.ip // "Unknown"')
+    country=$(echo "$ip_info" | jq -r '.country // "Unknown"')
+    
+    echo "[INFO] ✅ 代理连接成功 | 📍 IP: $ip_addr | 🌍 国家: $country"
+    
     echo "IS_PROXY=true" >> $GITHUB_ENV
     echo "PROXY_SERVER=socks5://127.0.0.1:1080" >> $GITHUB_ENV
     exit 0
   fi
-  echo "[WARN] 尝试 $i/3..."
+  echo "[WARN] 尝试 $i/3 失败，正在重试..."
   sleep 3
 done
 
