@@ -1,27 +1,53 @@
 #!/bin/bash
-# setup_proxy.sh - 多节点轮询解析与 sing-box 启动
+# setup_proxy.sh - 多节点轮询解析与 sing-box 启动 (优化修复版)
 export LC_ALL=C
 set -e
 
 export NODE_LINK=${NODE_LINK:-''}
 
+# 封装环境变量写入，兼容本地环境与 Github Actions
+set_env() {
+  local key=$1
+  local value=$2
+  if [ -n "$GITHUB_ENV" ]; then
+    echo "${key}=${value}" >> "$GITHUB_ENV"
+  else
+    export "${key}=${value}"
+  fi
+}
+
 if [ -z "$NODE_LINK" ]; then
   echo "[INFO] 未配置代理，直连模式"
-  echo "IS_PROXY=false" >> $GITHUB_ENV
+  set_env "IS_PROXY" "false"
+  set_env "USE_PROXY" "false"
+  set_env "PROXY_STATUS" "直连"
   exit 0
 fi
 
+# 智能检测包管理器安装 jq
 if ! command -v jq &> /dev/null; then
-  echo "[ERROR] jq 未安装，正在安装..."
-  sudo apt-get update && sudo apt-get install -y jq
+  echo "[WARN] jq 未安装，正在尝试安装..."
+  if command -v apt-get &> /dev/null; then
+    sudo apt-get update -q && sudo apt-get install -y jq
+  elif command -v apk &> /dev/null; then
+    sudo apk add jq
+  elif command -v yum &> /dev/null; then
+    sudo yum install -y jq
+  else
+    echo "[ERROR] 找不到支持的包管理器 (apt/apk/yum) 来安装 jq，请手动安装后重试。"
+    exit 1
+  fi
 fi
 
-command -v curl &>/dev/null && COMMAND="curl -so" || command -v wget &>/dev/null && COMMAND="wget -qO" || { echo "Error: neither curl nor wget found." >&2; exit 1; }
+command -v curl &>/dev/null && COMMAND="curl -sLo" || command -v wget &>/dev/null && COMMAND="wget -qO" || { echo "Error: neither curl nor wget found." >&2; exit 1; }
 
 echo "[INFO] 获取 sing-box 最新版本..."
-latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")')
+# 修复版本获取逻辑：使用纯 Bash 截取变量开头的 v，避免外部语法错误
+tag_name=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r '.tag_name // ""')
+latest_version="${tag_name#v}"
+
 if [ -z "$latest_version" ]; then
-  echo "[ERROR] 无法获取 sing-box 最新版本，将下载 v1.13.14"
+  echo "[WARN] 无法获取 sing-box 最新版本(可能触发 API 限制)，将默认使用 1.13.14"
   export latest_version=1.13.14
 fi
 echo "[INFO] 最新稳定版本: v${latest_version}"
@@ -33,7 +59,7 @@ case "${ARCH_RAW}" in
     'aarch64' | 'arm64') ARCH='arm64' ;;
     'armv7l')  ARCH='armv7' ;;
     's390x')   ARCH='s390x' ;;
-    *) echo "不支持的架构: ${ARCH_RAW}"; exit 1 ;;
+    *) echo "[ERROR] 不支持的架构: ${ARCH_RAW}"; exit 1 ;;
 esac
 
 $COMMAND sing-box-${latest_version}-linux-${ARCH}.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz"
@@ -51,19 +77,17 @@ url_decode() {
 
 # 将 NODE_LINK 按行拆分为数组
 mapfile -t NODE_ARRAY <<< "$NODE_LINK"
-
 total_nodes=${#NODE_ARRAY[@]}
-echo "[INFO] 共检测到代理节点配置行，准备轮询测试..."
+echo "[INFO] 共检测到 ${total_nodes} 个代理节点配置行，准备轮询测试..."
 
 node_idx=0
 for single_node in "${NODE_ARRAY[@]}"; do
-  # 清除任何不可见的空格和 \r 回车符，防止解析错位
   single_node=$(echo "$single_node" | tr -d '[:space:]')
   [ -z "$single_node" ] && continue
   
   node_idx=$((node_idx + 1))
   echo "----------------------------------------"
-  echo "[INFO] 正在尝试节点 [$node_idx] ..."
+  echo "[INFO] 正在尝试节点 [$node_idx / $total_nodes] ..."
 
   proto=$(echo "$single_node" | cut -d':' -f1)
   content="${single_node#*://}"
@@ -336,24 +360,38 @@ EOF
   sleep 1
 
   ./sing-box run -c sing-box-config.json > sing-box.log 2>&1 &
-  sleep 3
+  PID=$!
+  sleep 2
+
+  # 检查 sing-box 进程是否还在运行 (防止因配置语法错误秒退)
+  if ! kill -0 $PID 2>/dev/null; then
+    echo "[WARN] ❌ sing-box 启动失败 (可能是节点配置参数不受支持)，跳过该节点..."
+    cat sing-box.log | tail -n 5
+    continue
+  fi
 
   # 测试当前节点的连通性
   echo "[INFO] 测试节点连接性..."
-  ip_info=$(curl -x socks5://127.0.0.1:1080 -s --max-time 10 https://ipinfo.io/json || true)
+  ip_info=$(curl -x socks5://127.0.0.1:1080 -s --max-time 8 https://ipinfo.io/json || true)
 
   if [ -n "$ip_info" ] && echo "$ip_info" | jq -e '.ip' > /dev/null 2>&1; then
     ip_addr=$(echo "$ip_info" | jq -r '.ip // "Unknown"')
     country=$(echo "$ip_info" | jq -r '.country // "Unknown"')
 
     echo "[INFO] ✅ 节点 [$node_idx] 连接成功！ | 📍 IP: $ip_addr | 🌍 国家: $country"
-    echo "IS_PROXY=true" >> $GITHUB_ENV
-    echo "PROXY_SERVER=socks5://127.0.0.1:1080" >> $GITHUB_ENV
+    
+    set_env "IS_PROXY" "true"
+    set_env "USE_PROXY" "true"
+    set_env "PROXY_SERVER" "socks5://127.0.0.1:1080"
+    set_env "PROXY_STATUS" "代理: $ip_addr ($country)"
     exit 0
   else
     echo "[WARN] ❌ 节点 [$node_idx] 无法连接或超时，尝试下一个节点..."
+    [ -s sing-box.log ] && cat sing-box.log | tail -n 3
   fi
 done
 
-echo "[ERROR] ❌ 所有配置的代理节点均测试失败！"
-exit 1
+echo "[WARN] ❌ 所有配置的代理节点均测试失败，自动切换为直连模式！"
+set_env "USE_PROXY" "false"
+set_env "PROXY_STATUS" "直连 (代理全部失效)"
+exit 0
