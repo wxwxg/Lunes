@@ -1,5 +1,5 @@
 #!/bin/bash
-# setup_proxy.sh - 多节点轮询解析与 sing-box 启动 (终极无懈可击版)
+# setup_proxy.sh - 多节点轮询解析与 sing-box 启动
 export LC_ALL=C
 set -e
 
@@ -194,7 +194,10 @@ for single_node in "${NODE_ARRAY[@]}"; do
   outbound_username=""
   outbound_password2=""
   outbound_version="5"
-  outbound_insecure="false"
+  
+  # 关键修改：默认开启不安全证书允许 (insecure: true)，避免 SNI 伪装导致的报错
+  outbound_insecure="true"
+  
   outbound_alpn=""
 
   case "$proto" in
@@ -219,10 +222,6 @@ for single_node in "${NODE_ARRAY[@]}"; do
         fp=$(get_query_param_lc "$query" "fp"); [ -n "$fp" ] && outbound_fingerprint="$fp"
         pbk=$(get_query_param "$query" "pbk"); [ -n "$pbk" ] && outbound_reality_pbk="$pbk"
         sid=$(get_query_param "$query" "sid"); [ -n "$sid" ] && outbound_reality_sid="$sid"
-        
-        ins=$(get_query_param_lc "$query" "insecure")
-        alins=$(get_query_param_lc "$query" "allowinsecure")
-        if [ "$ins" = "1" ] || [ "$ins" = "true" ] || [ "$alins" = "1" ] || [ "$alins" = "true" ]; then outbound_insecure="true"; fi
       fi
       if [ -z "$outbound_host" ]; then outbound_host="$outbound_server"; fi
       if [ -z "$outbound_sni" ]; then outbound_sni="$outbound_server"; fi
@@ -270,10 +269,6 @@ for single_node in "${NODE_ARRAY[@]}"; do
         host=$(get_query_param "$query" "host"); [ -n "$host" ] && outbound_host="$host"
         sni=$(get_query_param "$query" "sni"); [ -n "$sni" ] && outbound_sni="$sni"
         fp=$(get_query_param_lc "$query" "fp"); [ -n "$fp" ] && outbound_fingerprint="$fp"
-        
-        ins=$(get_query_param_lc "$query" "insecure")
-        alins=$(get_query_param_lc "$query" "allowinsecure")
-        if [ "$ins" = "1" ] || [ "$ins" = "true" ] || [ "$alins" = "1" ] || [ "$alins" = "true" ]; then outbound_insecure="true"; fi
       fi
       if [ -z "$outbound_host" ]; then outbound_host="$outbound_server"; fi
       if [ -z "$outbound_sni" ]; then outbound_sni="$outbound_server"; fi
@@ -292,10 +287,6 @@ for single_node in "${NODE_ARRAY[@]}"; do
         obfs=$(get_query_param "$query" "obfs"); [ -n "$obfs" ] && outbound_obfs_password="$obfs"
         sni=$(get_query_param "$query" "sni"); [ -n "$sni" ] && outbound_sni="$sni"
         fp=$(get_query_param_lc "$query" "fp"); [ -n "$fp" ] && outbound_fingerprint="$fp"
-        
-        ins=$(get_query_param_lc "$query" "insecure")
-        alins=$(get_query_param_lc "$query" "allowinsecure")
-        if [ "$ins" = "1" ] || [ "$ins" = "true" ] || [ "$alins" = "1" ] || [ "$alins" = "true" ]; then outbound_insecure="true"; fi
         
         if [ -z "$outbound_auth" ]; then
           q_pass=$(get_query_param "$query" "password")
@@ -321,10 +312,6 @@ for single_node in "${NODE_ARRAY[@]}"; do
         fp=$(get_query_param_lc "$query" "fp"); [ -n "$fp" ] && outbound_fingerprint="$fp"
         cc=$(get_query_param_lc "$query" "congestion_control"); [ -n "$cc" ] && outbound_congestion="$cc"
         alpn=$(get_query_param_lc "$query" "alpn"); [ -n "$alpn" ] && outbound_alpn="$alpn"
-        
-        ins=$(get_query_param_lc "$query" "insecure")
-        alins=$(get_query_param_lc "$query" "allowinsecure")
-        if [ "$ins" = "1" ] || [ "$ins" = "true" ] || [ "$alins" = "1" ] || [ "$alins" = "true" ]; then outbound_insecure="true"; fi
       fi
       if [ -z "$outbound_sni" ]; then outbound_sni="$outbound_server"; fi
       ;;
@@ -341,9 +328,6 @@ for single_node in "${NODE_ARRAY[@]}"; do
       if [ -n "$query" ]; then
         sni=$(get_query_param "$query" "sni"); [ -n "$sni" ] && outbound_sni="$sni"
         fp=$(get_query_param_lc "$query" "fp"); [ -n "$fp" ] && outbound_fingerprint="$fp"
-        ins=$(get_query_param_lc "$query" "insecure")
-        alins=$(get_query_param_lc "$query" "allowinsecure")
-        if [ "$ins" = "1" ] || [ "$ins" = "true" ] || [ "$alins" = "1" ] || [ "$alins" = "true" ]; then outbound_insecure="true"; fi
       fi
       if [ -z "$outbound_sni" ]; then outbound_sni="$outbound_server"; fi
       ;;
