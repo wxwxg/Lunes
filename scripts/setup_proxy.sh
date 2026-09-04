@@ -445,23 +445,22 @@ for single_node in "${NODE_ARRAY[@]}"; do
 EOF
 
   # 进程深度清理
+  # 仅停止当前节点的 sing-box，快速切换，不影响其他进程
   if [ -n "$CURRENT_SB_PID" ]; then
-    kill -9 "$CURRENT_SB_PID" 2>/dev/null || true
+    kill "$CURRENT_SB_PID" 2>/dev/null || true
+    wait "$CURRENT_SB_PID" 2>/dev/null || true
+    CURRENT_SB_PID=""
   fi
-  pkill -f sing-box 2>/dev/null || true
-  if command -v fuser &>/dev/null; then
-    fuser -k 1080/tcp 2>/dev/null || true
-    fuser -k 1081/tcp 2>/dev/null || true
-  fi
-  sleep 1
 
   ./sing-box run -c sing-box-config.json > sing-box.log 2>&1 &
   CURRENT_SB_PID=$!
   sleep 2
 
-  if ! kill -0 $CURRENT_SB_PID 2>/dev/null; then
-    echo "[WARN] ❌ sing-box 启动失败 (配置参数校验不通过)，尝试下一个..."
+  if ! kill -0 "$CURRENT_SB_PID" 2>/dev/null; then
+    echo "[WARN] ❌ sing-box 启动失败 (配置参数校验不通过)，立即切换下一个..."
     if [ -f sing-box.log ]; then tail -n 5 sing-box.log; fi
+    wait "$CURRENT_SB_PID" 2>/dev/null || true
+    CURRENT_SB_PID=""
     continue
   fi
 
@@ -482,10 +481,31 @@ EOF
   else
     echo "[WARN] ❌ 节点 [$node_idx] 无法连接或超时，尝试下一个..."
     if [ -s sing-box.log ]; then tail -n 3 sing-box.log; fi
+
+    # 当前节点失败：只停止当前 PID，立即测试下一个节点
+    if [ -n "$CURRENT_SB_PID" ]; then
+      kill "$CURRENT_SB_PID" 2>/dev/null || true
+      wait "$CURRENT_SB_PID" 2>/dev/null || true
+      CURRENT_SB_PID=""
+    fi
   fi
 done
 
 echo "[WARN] ❌ 所有配置的代理节点均测试失败，自动切换为直连模式！"
+
+# 所有节点都失败：只停止当前 PID，不影响其他 sing-box 进程
+if [ -n "$CURRENT_SB_PID" ]; then
+  kill "$CURRENT_SB_PID" 2>/dev/null || true
+  wait "$CURRENT_SB_PID" 2>/dev/null || true
+  CURRENT_SB_PID=""
+fi
+
+# 明确清除代理环境变量，避免后续 app.py 误认为代理仍然启用
+set_env "IS_PROXY" "false"
 set_env "USE_PROXY" "false"
+set_env "PROXY_SERVER" ""
+set_env "PROXY_HTTP_SERVER" ""
 set_env "PROXY_STATUS" "直连 (代理全部失效)"
+
+echo "[INFO] ✅ 已切换为直连模式，继续执行后续任务"
 exit 0
