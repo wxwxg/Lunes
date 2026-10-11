@@ -1,19 +1,53 @@
 #!/bin/bash
 # setup_proxy.sh - 多节点轮询解析与 sing-box 启动
+# 修复记录 (2026-10-04):
+#  [致命] tr '-_' '+/' -> tr -- '-_' '+/' (原写法 tr 直接报错返回空, 导致 vmess 节点全部跳过、Base64 订阅永远解码失败)
+#  [致命] 连通性测试改用 socks5h:// (DNS 走代理, 避免本地 DNS 污染误判节点失效)
+#  [高]   hysteria2: obfs=类型 / obfs-password=密码 分开解析 (原来把类型当密码)
+#  [高]   tuic/socks 的 user:pass 按第一个冒号切分 (原来按最后一个, 密码含冒号会错位)
+#  [高]   非 GHA 环境变量写入 ./proxy.env (原来 export 在子 shell 里, exit 后即丢失)
+#  [中]   apt-get install base64 -> coreutils (Debian 系无 base64 独立包); sudo 按需使用
+#  [中]   端口校验: 纯数字/去前导零/范围 1-65535
+#  [中]   userinfo(密码/auth) 做 %xx 解码 (tuic/socks/hysteria2/trojan/anytls)
+#  [优化] sing-box check 先验配置; curl 超时+重试; GitHub API 支持 GH_TOKEN; 导出 PROXY_HTTP_SERVER
+#  [新增] ss:// (Shadowsocks): SIP002 / 老式整体base64 / 明文兼容，支持 plugin 参数
+# 修复记录 (2026-10-11):
+#  [高]   tuic alpn JSON 注入：awk 拼接加字符白名单（全脚本唯一未走 json_esc 的用户输入）
+#  [中]   连通性测试改用 _curl_test（--retry 0 快速失败，挂起节点不再拖 ~60s）
+#  [中]   vless/vmess 无 security 参数且端口 443 时默认启用 TLS（防可用节点被误判跳过）
+#  [低]   sing-box 启动后轮询 1080 端口代替固定 sleep 2（快机器不等、慢机器不误杀）
+#  [低]   包管理器安装失败加明确报错（原来 set -e 下静默退出）
+# 修复记录 (2026-10-11 合并版):
+#  [合]   取双方实现之长：apt/apk/yum 分步报错走 stderr；exec 3<> 探活只建连不发数据
 export LC_ALL=C
 set -e
 
 export NODE_LINK=${NODE_LINK:-''}
 
+# GHA 环境写 $GITHUB_ENV；本地环境写入 ./proxy.env（source 加载），避免子 shell export 丢失
+if [ -z "$GITHUB_ENV" ]; then
+  : > ./proxy.env
+fi
 set_env() {
   local key=$1
   local value=$2
   if [ -n "$GITHUB_ENV" ]; then
-    echo "${key}=${value}" >> "$GITHUB_ENV"
+    printf '%s=%s\n' "$key" "$value" >> "$GITHUB_ENV"
   else
-    export "${key}=${value}"
+    printf '%s=%q\n' "$key" "$value" >> ./proxy.env
   fi
 }
+proxy_env_hint() {
+  if [ -z "$GITHUB_ENV" ] && [ -s ./proxy.env ]; then
+    echo "[INFO] 非 GHA 环境：代理变量已写入 ./proxy.env，执行 'source ./proxy.env' 加载"
+  fi
+}
+trap proxy_env_hint EXIT
+
+# 统一 curl：超时 + 重试，避免长时间挂起
+_curl() { curl -sL --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 3 "$@"; }
+# 节点连通性测试专用：快速失败，不重试（挂起的节点不值得等待重试）
+_curl_test() { curl -sL --connect-timeout 8 --max-time 8 --retry 0 "$@"; }
 
 if [ -z "$NODE_LINK" ]; then
   echo "[INFO] 未配置代理，直连模式"
@@ -24,24 +58,47 @@ if [ -z "$NODE_LINK" ]; then
 fi
 
 # 智能检测包管理器安装必需依赖
+_SUDO=""
+if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+  _SUDO="sudo"
+fi
 for pkg in jq curl base64; do
-  if ! command -v $pkg &> /dev/null; then
-    echo "[WARN] $pkg 未安装，正在尝试安装..."
-    if command -v apt-get &> /dev/null; then
-      sudo apt-get update -q && sudo apt-get install -y $pkg coreutils
-    elif command -v apk &> /dev/null; then
-      sudo apk add $pkg coreutils
-    elif command -v yum &> /dev/null; then
-      sudo yum install -y $pkg coreutils
+  if ! command -v "$pkg" >/dev/null 2>&1; then
+    # base64 由 coreutils 提供，各发行版均无独立的 base64 包
+    realpkg="$pkg"
+    [ "$pkg" = "base64" ] && realpkg="coreutils"
+    echo "[WARN] $pkg 未安装，正在尝试安装 $realpkg ..."
+    if command -v apt-get >/dev/null 2>&1; then
+      if ! $_SUDO apt-get update -q; then
+        echo "[ERROR] apt-get update 失败，请检查网络或更换镜像源" >&2
+        exit 1
+      fi
+      if ! $_SUDO apt-get install -y "$realpkg"; then
+        echo "[ERROR] apt-get install $realpkg 失败，请手动安装后重试。" >&2
+        exit 1
+      fi
+    elif command -v apk >/dev/null 2>&1; then
+      if ! $_SUDO apk add "$realpkg"; then
+        echo "[ERROR] apk add $realpkg 失败，请手动安装后重试。" >&2
+        exit 1
+      fi
+    elif command -v yum >/dev/null 2>&1; then
+      if ! $_SUDO yum install -y "$realpkg"; then
+        echo "[ERROR] yum install $realpkg 失败，请手动安装后重试。" >&2
+        exit 1
+      fi
     else
-      echo "[ERROR] 找不到支持的包管理器安装 $pkg，请手动安装后重试。"
+      echo "[ERROR] 找不到支持的包管理器安装 $realpkg，请手动安装后重试。"
       exit 1
     fi
   fi
 done
 
 echo "[INFO] 获取 sing-box 最新版本..."
-tag_name=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r '.tag_name // ""' 2>/dev/null || echo "")
+_api_hdr=()
+_gh_tok="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+[ -n "$_gh_tok" ] && _api_hdr=(-H "Authorization: Bearer $_gh_tok")
+tag_name=$(_curl "${_api_hdr[@]}" "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r '.tag_name // ""' 2>/dev/null || echo "")
 latest_version="${tag_name#v}"
 if [ -z "$latest_version" ]; then
   echo "[WARN] 无法获取 sing-box 最新版本(可能触发 API 限制)，将默认使用 1.13.14"
@@ -61,7 +118,7 @@ esac
 
 if [ ! -f "./sing-box" ]; then
   echo "[INFO] 正在下载 sing-box 二进制文件..."
-  curl -sLo "sing-box-${latest_version}-linux-${ARCH}.tar.gz" "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz" || true
+  _curl -o "sing-box-${latest_version}-linux-${ARCH}.tar.gz" "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz" || true
   if [ -f "sing-box-${latest_version}-linux-${ARCH}.tar.gz" ]; then
     tar -xzf "sing-box-${latest_version}-linux-${ARCH}.tar.gz" 2>/dev/null || true
     if [ -f "sing-box-${latest_version}-linux-${ARCH}/sing-box" ]; then
@@ -72,6 +129,8 @@ if [ ! -f "./sing-box" ]; then
   if [ ! -f "./sing-box" ]; then echo "[ERROR] sing-box 下载或解压失败！"; exit 1; fi
   chmod +x sing-box
 fi
+# 已存在的二进制也确保可执行
+[ -f ./sing-box ] && chmod +x ./sing-box
 
 # ----------------- 核心安全助手函数 -----------------
 
@@ -88,20 +147,26 @@ url_decode() {
   printf '%b' "${encoded//%/\\x}"
 }
 
+# userinfo(%xx)解码：与 url_decode 不同，userinfo 中的 '+' 是字面加号，不转空格
+url_decode_userinfo() {
+  local s="${1//\\/\\\\}"
+  printf '%b' "${s//%/\\x}" 2>/dev/null || echo ""
+}
+
 # 容错 Base64 解码 (支持 URL-Safe 且自动补齐 =)
 safe_base64_decode() {
   local input="$1"
-  input=$(echo "$input" | tr -d '[:space:]' | tr '-_' '+/')
+  input=$(echo "$input" | tr -d '[:space:]' | tr -- '-_' '+/')
   local mod=$(( ${#input} % 4 ))
   if [ $mod -eq 2 ]; then input="${input}=="; elif [ $mod -eq 3 ]; then input="${input}="; fi
   echo "$input" | base64 -d 2>/dev/null || echo ""
 }
 
-# 安全参数提取 (原值)
+# 安全参数提取 (原值)；-m1 防同 key 多次匹配输出多行
 get_query_param() {
   local query="$1"
   local key="$2"
-  echo "&${query}" | grep -io "&${key}=[^&]*" | cut -d= -f2- || true
+  echo "&${query}" | grep -iom1 "&${key}=[^&]*" | cut -d= -f2- || true
 }
 
 # 安全参数提取 (强制小写)
@@ -113,6 +178,10 @@ get_query_param_lc() {
 parse_host_port() {
   local input="$1"
   local default_port="$2"
+
+  # 兼容 NekoBox 导出的 TUIC URI：host:port/?query
+  # authority 末尾允许有一个可选的 "/"，解析前去掉，避免端口变成 "30037/"。
+  input="${input%/}"
   
   if [[ "$input" =~ ^\[([a-fA-F0-9:]+)\]:([0-9]+)$ ]]; then
     outbound_server="${BASH_REMATCH[1]}"
@@ -132,6 +201,15 @@ parse_host_port() {
   else
     outbound_server="$input"
     outbound_port="$default_port"
+  fi
+}
+
+# 停止当前 sing-box（4 处重复逻辑收敛为一个函数，统一清理）
+stop_current() {
+  if [ -n "$CURRENT_SB_PID" ]; then
+    kill "$CURRENT_SB_PID" 2>/dev/null || true
+    wait "$CURRENT_SB_PID" 2>/dev/null || true
+    CURRENT_SB_PID=""
   fi
 }
 
@@ -187,16 +265,23 @@ for single_node in "${NODE_ARRAY[@]}"; do
   outbound_up_mbps=100
   outbound_down_mbps=100
   outbound_obfs_password=""
+  outbound_obfs_type="salamander"
   outbound_auth=""
   outbound_congestion="bbr"
-  outbound_udp_over_stream="true"
+  outbound_udp_over_stream="false"
+  outbound_udp_relay_mode="native"
   outbound_zerortt="false"
   outbound_username=""
   outbound_password2=""
   outbound_version="5"
+  outbound_method=""
+  outbound_plugin=""
+  outbound_plugin_opts=""
   
-  # 关键修改：默认开启不安全证书允许 (insecure: true)，避免 SNI 伪装导致的报错
+  # 默认允许不安全证书（避免 SNI 伪装导致的报错）；如需严格校验可导出 SB_INSECURE=false
+  # 注意：insecure=true 会失去对服务端证书的校验，存在中间人风险，请自行权衡
   outbound_insecure="true"
+  [ "$(printf '%s' "${SB_INSECURE:-true}" | tr '[:upper:]' '[:lower:]')" = "false" ] && outbound_insecure="false"
   
   outbound_alpn=""
 
@@ -255,6 +340,7 @@ for single_node in "${NODE_ARRAY[@]}"; do
     trojan)
       pass_rest="$content"
       password="${pass_rest%%@*}"
+      password="$(url_decode_userinfo "$password")"
       rest="${pass_rest#*@}"
       if [[ "$rest" == *"?"* ]]; then host_port="${rest%%"?"*}"; query="${rest#*"?"}"; else host_port="$rest"; query=""; fi
       
@@ -276,6 +362,7 @@ for single_node in "${NODE_ARRAY[@]}"; do
 
     hysteria2|hy2)
       if [[ "$content" == *"@"* ]]; then auth="${content%%@*}"; host_port="${content#*@}"; else auth=""; host_port="$content"; fi
+      auth="$(url_decode_userinfo "$auth")"
       if [[ "$host_port" == *"?"* ]]; then hp="${host_port%%"?"*}"; query="${host_port#*"?"}"; else hp="$host_port"; query=""; fi
       hp="${hp%/}"
       
@@ -284,14 +371,26 @@ for single_node in "${NODE_ARRAY[@]}"; do
       outbound_auth="$auth"
 
       if [ -n "$query" ]; then
-        obfs=$(get_query_param "$query" "obfs"); [ -n "$obfs" ] && outbound_obfs_password="$obfs"
+        # obfs=混淆类型，obfs-password=混淆密码（两者不要混淆）
+        obfs_type=$(get_query_param "$query" "obfs")
+        obfs_pw=$(get_query_param "$query" "obfs-password")
+        if [ -n "$obfs_pw" ]; then
+          outbound_obfs_type="${obfs_type:-salamander}"
+          outbound_obfs_password="$(url_decode_userinfo "$obfs_pw")"
+        elif [ -n "$obfs_type" ]; then
+          # 兼容旧写法：obfs 直接携带密码
+          outbound_obfs_type="salamander"
+          outbound_obfs_password="$(url_decode_userinfo "$obfs_type")"
+        fi
         sni=$(get_query_param "$query" "sni"); [ -n "$sni" ] && outbound_sni="$sni"
         fp=$(get_query_param_lc "$query" "fp"); [ -n "$fp" ] && outbound_fingerprint="$fp"
+        upmbps=$(get_query_param "$query" "upmbps"); [[ "$upmbps" =~ ^[0-9]+$ ]] && outbound_up_mbps="$upmbps"
+        downmbps=$(get_query_param "$query" "downmbps"); [[ "$downmbps" =~ ^[0-9]+$ ]] && outbound_down_mbps="$downmbps"
         
         if [ -z "$outbound_auth" ]; then
           q_pass=$(get_query_param "$query" "password")
           if [ -z "$q_pass" ]; then q_pass=$(get_query_param "$query" "auth"); fi
-          if [ -n "$q_pass" ]; then outbound_auth="$q_pass"; fi
+          if [ -n "$q_pass" ]; then outbound_auth="$(url_decode_userinfo "$q_pass")"; fi
         fi
       fi
       if [ -z "$outbound_sni" ]; then outbound_sni="$outbound_server"; fi
@@ -300,24 +399,58 @@ for single_node in "${NODE_ARRAY[@]}"; do
     tuic)
       uuid_pass="${content%%@*}"
       rest="${content#*@}"
-      uuid_pass_clean=$(echo "$uuid_pass" | sed 's/%3A/:/g')
-      if [[ "$uuid_pass_clean" == *":"* ]]; then outbound_uuid="${uuid_pass_clean%:*}"; outbound_password2="${uuid_pass_clean#*:}"; else outbound_uuid="$uuid_pass_clean"; outbound_password2=""; fi
+      # userinfo 整体先做 %xx 解码，再按第一个冒号切分 uuid:password
+      uuid_pass_clean="$(url_decode_userinfo "$uuid_pass")"
+      if [[ "$uuid_pass_clean" == *":"* ]]; then outbound_uuid="${uuid_pass_clean%%:*}"; outbound_password2="${uuid_pass_clean#*:}"; else outbound_uuid="$uuid_pass_clean"; outbound_password2=""; fi
       if [[ "$rest" == *"?"* ]]; then host_port="${rest%%"?"*}"; query="${rest#*"?"}"; else host_port="$rest"; query=""; fi
       
       parse_host_port "$host_port" "8443"
       outbound_type="tuic"
 
       if [ -n "$query" ]; then
-        sni=$(get_query_param "$query" "sni"); [ -n "$sni" ] && outbound_sni="$sni"
-        fp=$(get_query_param_lc "$query" "fp"); [ -n "$fp" ] && outbound_fingerprint="$fp"
-        cc=$(get_query_param_lc "$query" "congestion_control"); [ -n "$cc" ] && outbound_congestion="$cc"
-        alpn=$(get_query_param_lc "$query" "alpn"); [ -n "$alpn" ] && outbound_alpn="$alpn"
+        sni=$(get_query_param "$query" "sni"); [ -n "$sni" ] && outbound_sni="$(url_decode "$sni")"
+        fp=$(get_query_param_lc "$query" "fp"); [ -n "$fp" ] && outbound_fingerprint="$(url_decode "$fp")"
+        cc=$(get_query_param_lc "$query" "congestion_control"); [ -n "$cc" ] && outbound_congestion="$(url_decode "$cc")"
+        alpn=$(get_query_param_lc "$query" "alpn"); [ -n "$alpn" ] && outbound_alpn="$(url_decode "$alpn")"
+
+        relay=$(get_query_param_lc "$query" "udp_relay_mode")
+        if [ -n "$relay" ]; then
+          relay="$(url_decode "$relay")"
+          case "$relay" in
+            native|quic) outbound_udp_relay_mode="$relay" ;;
+          esac
+        fi
+
+        uos=$(get_query_param_lc "$query" "udp_over_stream")
+        if [ -n "$uos" ]; then
+          case "$(url_decode "$uos")" in
+            1|true|yes) outbound_udp_over_stream="true" ;;
+            0|false|no) outbound_udp_over_stream="false" ;;
+          esac
+        fi
+
+        zrt=$(get_query_param_lc "$query" "zero_rtt_handshake")
+        if [ -n "$zrt" ]; then
+          case "$(url_decode "$zrt")" in
+            1|true|yes) outbound_zerortt="true" ;;
+            0|false|no) outbound_zerortt="false" ;;
+          esac
+        fi
+
+        ai=$(get_query_param_lc "$query" "allow_insecure")
+        if [ -n "$ai" ]; then
+          case "$(url_decode "$ai")" in
+            1|true|yes) outbound_insecure="true" ;;
+            0|false|no) outbound_insecure="false" ;;
+          esac
+        fi
       fi
       if [ -z "$outbound_sni" ]; then outbound_sni="$outbound_server"; fi
       ;;
 
     anytls)
       password="${content%%@*}"
+      password="$(url_decode_userinfo "$password")"
       rest="${content#*@}"
       if [[ "$rest" == *"?"* ]]; then host_port="${rest%%"?"*}"; query="${rest#*"?"}"; else host_port="$rest"; query=""; fi
       
@@ -336,11 +469,12 @@ for single_node in "${NODE_ARRAY[@]}"; do
       if [[ "$content" == *"@"* ]]; then
         user_pass="${content%%@*}"
         host_port="${content#*@}"
+        # 按第一个冒号切分 user:password，再做 %xx 解码
         if [[ "$user_pass" == *":"* ]]; then
-          outbound_username="${user_pass%:*}"
-          outbound_password2="${user_pass#*:}"
+          outbound_username="$(url_decode_userinfo "${user_pass%%:*}")"
+          outbound_password2="$(url_decode_userinfo "${user_pass#*:}")"
         else
-          outbound_username="$user_pass"
+          outbound_username="$(url_decode_userinfo "$user_pass")"
           outbound_password2=""
         fi
       else
@@ -350,14 +484,67 @@ for single_node in "${NODE_ARRAY[@]}"; do
       outbound_type="socks"
       ;;
 
+    ss)
+      # SIP002: ss://base64(method:password)@host:port/?plugin=xxx#name
+      # 兼容老格式: ss://base64(method:password@host:port)#name
+      # 兼容非标准明文: ss://method:password@host:port
+      ss_full="$content"
+      if [[ "$ss_full" == *"?"* ]]; then
+        ss_main="${ss_full%%"?"*}"; ss_query="${ss_full#*"?"}"
+      else
+        ss_main="$ss_full"; ss_query=""
+      fi
+      if [[ "$ss_main" == *"@"* ]]; then
+        _ui_b64="${ss_main%%@*}"
+        _hp="${ss_main#*@}"
+        _hp="${_hp%/}"  # 去掉 host 尾部可能残留的 /（如 host:port/?plugin=...）
+        _ui="$(safe_base64_decode "$_ui_b64")"
+        if [ -z "$_ui" ] || [[ "$_ui" != *":"* ]]; then
+          # base64 解码失败或无冒号，当作明文 method:password 处理
+          _ui="$_ui_b64"
+        fi
+      else
+        _dec="$(safe_base64_decode "$ss_main")"
+        if [ -z "$_dec" ]; then echo "[WARN] SS Base64 解码失败"; continue; fi
+        # 整体 base64：method:password@host:port，按最后一个 @ 切分 host
+        _hp="${_dec##*@}"
+        _ui="${_dec%@*}"
+      fi
+      # method:password 按第一个冒号切分
+      outbound_method="${_ui%%:*}"
+      _ss_pw="${_ui#*:}"
+      if [ -z "$outbound_method" ] || [ "$_ui" = "$outbound_method" ]; then
+        echo "[WARN] SS 无法解析出 method:password，跳过"
+        continue
+      fi
+      outbound_password="$(url_decode_userinfo "$_ss_pw")"
+      parse_host_port "$_hp" "8388"
+      outbound_type="shadowsocks"
+      # plugin 形如 obfs-local;obfs=http;obfs-host=x -> plugin + plugin_opts
+      if [ -n "$ss_query" ]; then
+        _plug="$(get_query_param "$ss_query" "plugin")"
+        if [ -n "$_plug" ]; then
+          _plug="$(url_decode "$_plug")"
+          outbound_plugin="${_plug%%;*}"
+          if [[ "$_plug" == *";"* ]]; then outbound_plugin_opts="${_plug#*;}"; fi
+        fi
+      fi
+      ;;
+
     *)
       echo "[WARN] 不支持的协议类型: $proto，跳过"
       continue
       ;;
   esac
 
-  if [ -z "$outbound_server" ] || [ -z "$outbound_port" ] || ! [[ "$outbound_port" =~ ^[0-9]+$ ]]; then
+  if [ -z "$outbound_server" ] || ! [[ "$outbound_port" =~ ^[0-9]{1,5}$ ]]; then
     echo "[WARN] 无法解析到有效的服务器地址或数字端口，跳过"
+    continue
+  fi
+  # 去除前导零并校验端口范围（避免 "080" 之类生成非法 JSON）
+  outbound_port=$((10#$outbound_port))
+  if [ "$outbound_port" -lt 1 ] || [ "$outbound_port" -gt 65535 ]; then
+    echo "[WARN] 端口超出有效范围 (1-65535)，跳过"
     continue
   fi
 
@@ -376,17 +563,36 @@ for single_node in "${NODE_ARRAY[@]}"; do
   J_UNM=$(json_esc "$outbound_username")
   J_PBK=$(json_esc "$outbound_reality_pbk")
   J_SID=$(json_esc "$outbound_reality_sid")
+  J_MTD=$(json_esc "$outbound_method")
+  J_PLG=$(json_esc "$outbound_plugin")
+  J_PLO=$(json_esc "$outbound_plugin_opts")
+  # 查询参数类（枚举值）也统一转义，杜绝 JSON 注入
+  J_TT=$(json_esc "$outbound_transport_type")
+  J_FP=$(json_esc "$outbound_fingerprint")
+  J_FLW=$(json_esc "$outbound_flow")
+  J_CC=$(json_esc "$outbound_congestion")
+  J_OBFT=$(json_esc "$outbound_obfs_type")
 
   jq_outbound="{\"type\":\"$outbound_type\",\"tag\":\"proxy\",\"server\":\"$J_SVR\",\"server_port\":$outbound_port"
   case "$outbound_type" in
     vless)
       jq_outbound="$jq_outbound,\"uuid\":\"$J_UID\""
-      if [ -n "$outbound_flow" ]; then jq_outbound="$jq_outbound,\"flow\":\"$outbound_flow\""; fi
-      if [ "$outbound_transport_type" != "tcp" ]; then 
-        jq_outbound="$jq_outbound,\"transport\":{\"type\":\"$outbound_transport_type\",\"path\":\"$J_PTH\",\"headers\":{\"Host\":\"$J_HST\"}}"
+      if [ -n "$outbound_flow" ]; then jq_outbound="$jq_outbound,\"flow\":\"$J_FLW\""; fi
+      if [ "$outbound_transport_type" != "tcp" ]; then
+        if [ "$outbound_transport_type" = "grpc" ]; then
+          jq_outbound="$jq_outbound,\"transport\":{\"type\":\"grpc\",\"service_name\":\"$J_PTH\"}"
+        else
+          jq_outbound="$jq_outbound,\"transport\":{\"type\":\"$J_TT\",\"path\":\"$J_PTH\",\"headers\":{\"Host\":\"$J_HST\"}}"
+        fi
       fi
       tls_enabled="false"; if [ "$outbound_security" = "tls" ] || [ "$outbound_security" = "reality" ]; then tls_enabled="true"; fi
-      tls_json="{\"enabled\":$tls_enabled,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$outbound_fingerprint\"}"
+      # 启发式：security 未指定但端口为 443 时默认开启 TLS（部分订阅省略 security 参数，
+      # 否则 443 上的 TLS 节点会被误判"无法连接"跳过，且日志看不出真实原因）
+      if [ "$tls_enabled" = "false" ] && [ -z "$outbound_security" ] && [ "$outbound_port" = "443" ]; then
+        tls_enabled="true"
+        echo "[INFO] 节点 [$node_idx] 端口 443 未指定 security，默认启用 TLS"
+      fi
+      tls_json="{\"enabled\":$tls_enabled,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$J_FP\"}"
       if [ "$outbound_security" = "reality" ]; then tls_json="$tls_json,\"reality\":{\"enabled\":true,\"public_key\":\"$J_PBK\",\"short_id\":\"$J_SID\"}"; fi
       tls_json="$tls_json}"
       jq_outbound="$jq_outbound,\"tls\":$tls_json"
@@ -394,41 +600,71 @@ for single_node in "${NODE_ARRAY[@]}"; do
     vmess)
       jq_outbound="$jq_outbound,\"uuid\":\"$J_UID\",\"security\":\"auto\""
       if [ "$outbound_transport_type" != "tcp" ]; then
-        jq_outbound="$jq_outbound,\"transport\":{\"type\":\"$outbound_transport_type\",\"path\":\"$J_PTH\",\"headers\":{\"Host\":\"$J_HST\"}}"
+        if [ "$outbound_transport_type" = "grpc" ]; then
+          jq_outbound="$jq_outbound,\"transport\":{\"type\":\"grpc\",\"service_name\":\"$J_PTH\"}"
+        else
+          jq_outbound="$jq_outbound,\"transport\":{\"type\":\"$J_TT\",\"path\":\"$J_PTH\",\"headers\":{\"Host\":\"$J_HST\"}}"
+        fi
       fi
       tls_enabled="false"; if [ "$outbound_security" = "tls" ]; then tls_enabled="true"; fi
-      jq_outbound="$jq_outbound,\"tls\":{\"enabled\":$tls_enabled,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$outbound_fingerprint\"}}"
+      # 启发式：tls 字段缺失但端口为 443 时默认开启 TLS（同 vless）
+      if [ "$tls_enabled" = "false" ] && [ -z "$outbound_security" ] && [ "$outbound_port" = "443" ]; then
+        tls_enabled="true"
+        echo "[INFO] 节点 [$node_idx] 端口 443 未指定 tls，默认启用 TLS"
+      fi
+      jq_outbound="$jq_outbound,\"tls\":{\"enabled\":$tls_enabled,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$J_FP\"}}"
       ;;
     trojan)
       jq_outbound="$jq_outbound,\"password\":\"$J_PWD\""
       if [ "$outbound_transport_type" != "tcp" ]; then
-        jq_outbound="$jq_outbound,\"transport\":{\"type\":\"$outbound_transport_type\",\"path\":\"$J_PTH\",\"headers\":{\"Host\":\"$J_HST\"}}"
+        if [ "$outbound_transport_type" = "grpc" ]; then
+          jq_outbound="$jq_outbound,\"transport\":{\"type\":\"grpc\",\"service_name\":\"$J_PTH\"}"
+        else
+          jq_outbound="$jq_outbound,\"transport\":{\"type\":\"$J_TT\",\"path\":\"$J_PTH\",\"headers\":{\"Host\":\"$J_HST\"}}"
+        fi
       fi
-      jq_outbound="$jq_outbound,\"tls\":{\"enabled\":true,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$outbound_fingerprint\"}}"
+      jq_outbound="$jq_outbound,\"tls\":{\"enabled\":true,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$J_FP\"}}"
       ;;
     hysteria2)
       jq_outbound="$jq_outbound,\"up_mbps\":$outbound_up_mbps,\"down_mbps\":$outbound_down_mbps"
-      if [ -n "$outbound_obfs_password" ]; then jq_outbound="$jq_outbound,\"obfs\":{\"type\":\"salamander\",\"password\":\"$J_OBF\"}"; fi
+      if [ -n "$outbound_obfs_password" ]; then jq_outbound="$jq_outbound,\"obfs\":{\"type\":\"$J_OBFT\",\"password\":\"$J_OBF\"}"; fi
       if [ -n "$outbound_auth" ]; then jq_outbound="$jq_outbound,\"password\":\"$J_ATH\""; fi
       jq_outbound="$jq_outbound,\"tls\":{\"enabled\":true,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure}"
       ;;
     tuic)
       jq_outbound="$jq_outbound,\"uuid\":\"$J_UID\""
       if [ -n "$outbound_password2" ]; then jq_outbound="$jq_outbound,\"password\":\"$J_PW2\""; fi
-      jq_outbound="$jq_outbound,\"congestion_control\":\"$outbound_congestion\",\"udp_over_stream\":$outbound_udp_over_stream,\"zero_rtt_handshake\":$outbound_zerortt"
+      jq_outbound="$jq_outbound,\"congestion_control\":\"$J_CC\""
+      if [ "$outbound_udp_over_stream" = "true" ]; then
+        jq_outbound="$jq_outbound,\"udp_over_stream\":true"
+      else
+        jq_outbound="$jq_outbound,\"udp_relay_mode\":\"$outbound_udp_relay_mode\""
+      fi
+      jq_outbound="$jq_outbound,\"zero_rtt_handshake\":$outbound_zerortt"
       tls_json="{\"enabled\":true,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure"
-      if [ -n "$outbound_alpn" ]; then tls_json="$tls_json,\"alpn\":[\"$outbound_alpn\"]"; fi
+      if [ -n "$outbound_alpn" ]; then
+        # alpn=a,b 需要生成 JSON 数组；字符白名单防 JSON 注入（合法值仅字母数字 . / _ -）
+        alpn_json="$(printf '%s' "$outbound_alpn" | awk -F',' '{for(i=1;i<=NF;i++){gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i); if($i ~ /^[A-Za-z0-9.\/_-]+$/){if(n++) printf ","; printf "\"%s\"", $i}}}')"
+        if [ -n "$alpn_json" ]; then tls_json="$tls_json,\"alpn\":[$alpn_json]"; fi
+      fi
       tls_json="$tls_json}"
       jq_outbound="$jq_outbound,\"tls\":$tls_json"
       ;;
     anytls)
       jq_outbound="$jq_outbound,\"password\":\"$J_PWD\""
-      jq_outbound="$jq_outbound,\"tls\":{\"enabled\":true,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$outbound_fingerprint\"}}"
+      jq_outbound="$jq_outbound,\"tls\":{\"enabled\":true,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$J_FP\"}}"
       ;;
     socks)
       if [ -n "$outbound_username" ]; then jq_outbound="$jq_outbound,\"username\":\"$J_UNM\""; fi
       if [ -n "$outbound_password2" ]; then jq_outbound="$jq_outbound,\"password\":\"$J_PW2\""; fi
       jq_outbound="$jq_outbound,\"version\":\"$outbound_version\""
+      ;;
+    shadowsocks)
+      jq_outbound="$jq_outbound,\"method\":\"$J_MTD\",\"password\":\"$J_PWD\""
+      if [ -n "$outbound_plugin" ]; then
+        jq_outbound="$jq_outbound,\"plugin\":\"$J_PLG\""
+        if [ -n "$outbound_plugin_opts" ]; then jq_outbound="$jq_outbound,\"plugin_opts\":\"$J_PLO\""; fi
+      fi
       ;;
   esac
   jq_outbound="$jq_outbound}"
@@ -444,28 +680,43 @@ for single_node in "${NODE_ARRAY[@]}"; do
 }
 EOF
 
+  # 先校验配置合法性，失败直接跳过（比启动后猜要快、报错更清晰）
+  if ! ./sing-box check -c sing-box-config.json > sing-box-check.log 2>&1; then
+    echo "[WARN] ❌ sing-box 配置校验失败，跳过该节点"
+    tail -n 5 sing-box-check.log
+    continue
+  fi
+
   # 进程深度清理
   # 仅停止当前节点的 sing-box，快速切换，不影响其他进程
-  if [ -n "$CURRENT_SB_PID" ]; then
-    kill "$CURRENT_SB_PID" 2>/dev/null || true
-    wait "$CURRENT_SB_PID" 2>/dev/null || true
-    CURRENT_SB_PID=""
-  fi
+  stop_current
 
   ./sing-box run -c sing-box-config.json > sing-box.log 2>&1 &
   CURRENT_SB_PID=$!
-  sleep 2
+
+  # 轮询等待 socks 入站就绪（最多 5 秒）：快机器不等、慢机器不误杀，代替固定 sleep 2；
+  # exec 3<> 只建连不发数据（比 echo 探活更干净），子 shell 包裹以压住 refused 报错，进程崩溃时提前跳出
+  for _i in $(seq 1 10); do
+    if ! kill -0 "$CURRENT_SB_PID" 2>/dev/null; then break; fi
+    if (exec 3<>/dev/tcp/127.0.0.1/1080) 2>/dev/null; then break; fi
+    sleep 0.5
+  done
 
   if ! kill -0 "$CURRENT_SB_PID" 2>/dev/null; then
     echo "[WARN] ❌ sing-box 启动失败 (配置参数校验不通过)，立即切换下一个..."
     if [ -f sing-box.log ]; then tail -n 5 sing-box.log; fi
-    wait "$CURRENT_SB_PID" 2>/dev/null || true
-    CURRENT_SB_PID=""
+    stop_current
     continue
   fi
 
   echo "[INFO] 测试节点连接性..."
-  ip_info=$(curl -x socks5://127.0.0.1:1080 -s --max-time 8 https://ipinfo.io/json || true)
+  # 用 socks5h：DNS 解析走代理，避免本地 DNS 污染导致误判节点失效；
+  # 测试专用 _curl_test 不重试，挂起节点快速失败、立即换下一个
+  ip_info=$(_curl_test -x socks5h://127.0.0.1:1080 https://ipinfo.io/json || true)
+  # ipinfo 偶发限流：备用端点
+  if [ -z "$ip_info" ]; then
+    ip_info=$(_curl_test -x socks5h://127.0.0.1:1080 "https://api.ipify.org?format=json" || true)
+  fi
 
   if [ -n "$ip_info" ] && echo "$ip_info" | jq -e '.ip' > /dev/null 2>&1; then
     ip_addr=$(echo "$ip_info" | jq -r '.ip // "Unknown"' 2>/dev/null || echo "Unknown")
@@ -476,6 +727,7 @@ EOF
     set_env "IS_PROXY" "true"
     set_env "USE_PROXY" "true"
     set_env "PROXY_SERVER" "socks5://127.0.0.1:1080"
+    set_env "PROXY_HTTP_SERVER" "http://127.0.0.1:1081"
     set_env "PROXY_STATUS" "代理: $ip_addr ($country)"
     exit 0
   else
@@ -483,22 +735,14 @@ EOF
     if [ -s sing-box.log ]; then tail -n 3 sing-box.log; fi
 
     # 当前节点失败：只停止当前 PID，立即测试下一个节点
-    if [ -n "$CURRENT_SB_PID" ]; then
-      kill "$CURRENT_SB_PID" 2>/dev/null || true
-      wait "$CURRENT_SB_PID" 2>/dev/null || true
-      CURRENT_SB_PID=""
-    fi
+    stop_current
   fi
 done
 
 echo "[WARN] ❌ 所有配置的代理节点均测试失败，自动切换为直连模式！"
 
 # 所有节点都失败：只停止当前 PID，不影响其他 sing-box 进程
-if [ -n "$CURRENT_SB_PID" ]; then
-  kill "$CURRENT_SB_PID" 2>/dev/null || true
-  wait "$CURRENT_SB_PID" 2>/dev/null || true
-  CURRENT_SB_PID=""
-fi
+stop_current
 
 # 明确清除代理环境变量，避免后续 app.py 误认为代理仍然启用
 set_env "IS_PROXY" "false"
