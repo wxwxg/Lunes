@@ -240,27 +240,114 @@ def bypass_cloudflare_interstitial(sb, email: str, max_attempts: int = 3) -> boo
     return False
 
 
-def wait_for_turnstile_success(sb, timeout: int = 30) -> bool:
-    logger.info("等待 Turnstile 验证...")
+# ================== Turnstile 处理（参照 xserver 的 handle_turnstile） ==================
+def _get_turnstile_token(sb) -> str:
+    """读取 cf-turnstile-response 隐藏域 token（存在且足够长才算通过）"""
+    try:
+        token = sb.execute_script('''
+            var i = document.querySelector('input[name="cf-turnstile-response"]');
+            return (i && i.value) || '';
+        ''')
+        return token if isinstance(token, str) and len(token) > 20 else ""
+    except Exception:
+        return ""
+
+
+def _turnstile_challenge_present(sb) -> bool:
+    """页面上是否真的有 Turnstile 挑战控件"""
+    try:
+        return bool(sb.execute_script('''
+            return !!(document.querySelector('.cf-turnstile, [data-sitekey], '
+                + 'iframe[src*="challenges.cloudflare.com"]'));
+        '''))
+    except Exception:
+        return False
+
+
+def _turnstile_widget_in_dom(sb) -> bool:
+    """Turnstile 容器是否已进入 DOM（注意：进 DOM ≠ widget JS 已就绪）"""
+    try:
+        return bool(sb.execute_script('''
+            var el = document.querySelector('.cf-turnstile iframe[src*="challenges.cloudflare.com"]')
+                  || document.querySelector('iframe[src*="challenges.cloudflare.com"]')
+                  || document.querySelector('.cf-turnstile')
+                  || document.querySelector('[data-sitekey]');
+            return !!(el && el.getClientRects && el.getClientRects().length > 0);
+        '''))
+    except Exception:
+        return False
+
+
+def _poll_turnstile_token(sb, timeout: int = 15) -> str:
+    """轮询等待 token 出现，返回 token（超时返回空串）"""
     start = time.time()
     while time.time() - start < timeout:
-        try:
-            success = sb.execute_script('''
-                var resp = document.querySelector('input[name="cf-turnstile-response"]');
-                if (resp && resp.value && resp.value.length > 20) return true;
-                var grecap = document.querySelector('textarea[name="g-recaptcha-response"]');
-                if (grecap && grecap.value && grecap.value.length > 20) return true;
-                var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-                if (iframe && iframe.getAttribute("data-state") === "solved") return true;
-                return false;
-            ''')
-            if success:
-                logger.info("✅ Turnstile 验证成功")
-                return True
-        except:
-            pass
+        token = _get_turnstile_token(sb)
+        if token:
+            return token
         time.sleep(1)
-    logger.warning("⏰ Turnstile 验证超时")
+    return ""
+
+
+def handle_turnstile(sb, max_attempts: int = 3) -> bool:
+    """处理登录表单的 Turnstile。
+
+    流程：已有 token → 直接通过；无挑战控件 → 直接通过（继续正常流程）；
+    否则等容器进 DOM → 等 2 秒让 widget 就绪 → 点击 → 轮询 token → 拿到后多确认一次。
+    """
+    logger.info("🤖 检查 Turnstile...")
+    if _get_turnstile_token(sb):
+        logger.info("✅ Turnstile 已通过（有 token）")
+        return True
+
+    # 登录页未必每次都弹 Turnstile：没有挑战控件就继续正常流程，
+    # 别把"找不到验证码"误判成验证失败去空点。
+    if not _turnstile_challenge_present(sb):
+        logger.info("ℹ️ 当前页面未发现 Turnstile 控件，继续正常流程")
+        return True
+
+    miss_streak = 0  # 连续找不到容器的次数；连续 2 次直接放弃，省时间
+    for attempt in range(max_attempts):
+        # 等容器进 DOM（最多 10 秒）
+        found = False
+        for _ in range(10):
+            if _turnstile_widget_in_dom(sb):
+                found = True
+                break
+            time.sleep(1)
+        if not found:
+            miss_streak += 1
+            logger.warning(f"⚠️ 第 {attempt + 1} 次没找到 Turnstile 容器")
+            if miss_streak >= 2:
+                logger.warning("⚠️ 连续 2 次找不到 Turnstile 容器，提前放弃")
+                break
+            continue
+        miss_streak = 0
+
+        # 容器进 DOM ≠ widget 可交互：iframe 的 JS 可能还在初始化，
+        # 此时点击会被吞掉（xserver 实锤：第一次必失败、第二次必成功）。
+        # 等 2 秒让 widget 就绪再点。
+        logger.info("⏳ Turnstile 容器已出现，等待 2 秒让 widget 初始化...")
+        time.sleep(2)
+
+        try:
+            sb.uc_gui_click_captcha()
+            logger.info(f"点击验证码第 {attempt + 1} 次")
+        except Exception as e:
+            logger.warning(f"点击验证码异常 (第 {attempt + 1} 次): {e}")
+        time.sleep(2)
+
+        token = _poll_turnstile_token(sb, timeout=15)
+        if token:
+            # 刚拿到 token 时可能被 CF 重置，多确认一次稳定
+            time.sleep(1)
+            if _get_turnstile_token(sb):
+                logger.info("✅ Turnstile 验证通过")
+                return True
+
+        logger.info(f"⏳ 第 {attempt + 1} 次轮询未通过，重试...")
+
+    logger.warning("❌ Turnstile 多次尝试后仍未通过")
     return False
 
 
@@ -361,22 +448,10 @@ def fill_and_submit(sb, email: str, password: str) -> bool:
     safe_screenshot(sb, sp)
 
     logger.info("处理 Turnstile 验证码...")
-    already_done = wait_for_turnstile_success(sb, timeout=5)
-    if already_done:
-        logger.info("Turnstile 已自动完成，直接提交")
+    if handle_turnstile(sb):
+        logger.info("Turnstile 已就绪，准备提交")
     else:
-        logger.info("Turnstile 未自动完成，尝试点击...")
-        for click_attempt in range(3):
-            try:
-                sb.uc_gui_click_captcha()
-                logger.info(f"点击验证码第 {click_attempt + 1} 次")
-            except Exception as e:
-                logger.warning(f"点击验证码异常 (第 {click_attempt + 1} 次): {e}")
-            time.sleep(2)
-            if wait_for_turnstile_success(sb, timeout=10):
-                break
-        else:
-            logger.warning("Turnstile 多次尝试后仍未通过，尝试强制提交...")
+        logger.warning("Turnstile 未通过，尝试强制提交...")
 
     sp = screenshot_path("04-before-submit")
     safe_screenshot(sb, sp)
